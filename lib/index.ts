@@ -9,6 +9,7 @@ import {
   Server as Engine,
   ServerOptions as EngineOptions,
   AttachOptions,
+  uServer,
 } from "engine.io";
 import { Client } from "./client";
 import { EventEmitter } from "events";
@@ -27,6 +28,7 @@ import {
   StrictEventEmitter,
   EventNames,
 } from "./typed-events";
+import { patchAdapter, restoreAdapter, serveFile } from "./uws.js";
 
 const debug = debugModule("socket.io:server");
 
@@ -72,16 +74,23 @@ interface ServerOptions extends EngineOptions, AttachOptions {
 export class Server<
   ListenEvents extends EventsMap = DefaultEventsMap,
   EmitEvents extends EventsMap = ListenEvents,
-  ServerSideEvents extends EventsMap = DefaultEventsMap
+  ServerSideEvents extends EventsMap = DefaultEventsMap,
+  SocketData = any
 > extends StrictEventEmitter<
   ServerSideEvents,
   EmitEvents,
-  ServerReservedEventsMap<ListenEvents, EmitEvents, ServerSideEvents>
+  ServerReservedEventsMap<
+    ListenEvents,
+    EmitEvents,
+    ServerSideEvents,
+    SocketData
+  >
 > {
   public readonly sockets: Namespace<
     ListenEvents,
     EmitEvents,
-    ServerSideEvents
+    ServerSideEvents,
+    SocketData
   >;
   /**
    * A reference to the underlying Engine.IO server.
@@ -103,11 +112,13 @@ export class Server<
   /**
    * @private
    */
-  _nsps: Map<string, Namespace<ListenEvents, EmitEvents, ServerSideEvents>> =
-    new Map();
+  _nsps: Map<
+    string,
+    Namespace<ListenEvents, EmitEvents, ServerSideEvents, SocketData>
+  > = new Map();
   private parentNsps: Map<
     ParentNspNameMatchFn,
-    ParentNamespace<ListenEvents, EmitEvents, ServerSideEvents>
+    ParentNamespace<ListenEvents, EmitEvents, ServerSideEvents, SocketData>
   > = new Map();
   private _adapter?: AdapterConstructor;
   private _serveClient: boolean;
@@ -188,7 +199,9 @@ export class Server<
     name: string,
     auth: { [key: string]: any },
     fn: (
-      nsp: Namespace<ListenEvents, EmitEvents, ServerSideEvents> | false
+      nsp:
+        | Namespace<ListenEvents, EmitEvents, ServerSideEvents, SocketData>
+        | false
     ) => void
   ): void {
     if (this.parentNsps.size === 0) return fn(false);
@@ -335,6 +348,69 @@ export class Server<
     this.initEngine(srv, opts);
 
     return this;
+  }
+
+  public attachApp(app /*: TemplatedApp */, opts: Partial<ServerOptions> = {}) {
+    // merge the options passed to the Socket.IO server
+    Object.assign(opts, this.opts);
+    // set engine.io path to `/socket.io`
+    opts.path = opts.path || this._path;
+
+    // initialize engine
+    debug("creating uWebSockets.js-based engine with opts %j", opts);
+    const engine = new uServer(opts);
+
+    engine.attach(app, opts);
+
+    // bind to engine events
+    this.bind(engine);
+
+    if (this._serveClient) {
+      // attach static file serving
+      app.get(`${this._path}/*`, (res, req) => {
+        if (!this.clientPathRegex.test(req.getUrl())) {
+          req.setYield(true);
+          return;
+        }
+
+        const filename = req
+          .getUrl()
+          .replace(this._path, "")
+          .replace(/\?.*$/, "")
+          .replace(/^\//, "");
+        const isMap = dotMapRegex.test(filename);
+        const type = isMap ? "map" : "source";
+
+        // Per the standard, ETags must be quoted:
+        // https://tools.ietf.org/html/rfc7232#section-2.3
+        const expectedEtag = '"' + clientVersion + '"';
+        const weakEtag = "W/" + expectedEtag;
+
+        const etag = req.getHeader("if-none-match");
+        if (etag) {
+          if (expectedEtag === etag || weakEtag === etag) {
+            debug("serve client %s 304", type);
+            res.writeStatus("304 Not Modified");
+            res.end();
+            return;
+          }
+        }
+
+        debug("serve client %s", type);
+
+        res.writeHeader("cache-control", "public, max-age=0");
+        res.writeHeader(
+          "content-type",
+          "application/" + (isMap ? "json" : "javascript")
+        );
+        res.writeHeader("etag", expectedEtag);
+
+        const filepath = path.join(__dirname, "../client-dist/", filename);
+        serveFile(res, filepath);
+      });
+    }
+
+    patchAdapter(app);
   }
 
   /**
@@ -504,8 +580,10 @@ export class Server<
    */
   public of(
     name: string | RegExp | ParentNspNameMatchFn,
-    fn?: (socket: Socket<ListenEvents, EmitEvents, ServerSideEvents>) => void
-  ): Namespace<ListenEvents, EmitEvents, ServerSideEvents> {
+    fn?: (
+      socket: Socket<ListenEvents, EmitEvents, ServerSideEvents, SocketData>
+    ) => void
+  ): Namespace<ListenEvents, EmitEvents, ServerSideEvents, SocketData> {
     if (typeof name === "function" || name instanceof RegExp) {
       const parentNsp = new ParentNamespace(this);
       debug("initializing parent namespace %s", parentNsp.name);
@@ -553,6 +631,9 @@ export class Server<
 
     this.engine.close();
 
+    // restore the Adapter prototype
+    restoreAdapter();
+
     if (this.httpServer) {
       this.httpServer.close(fn);
     } else {
@@ -568,7 +649,7 @@ export class Server<
    */
   public use(
     fn: (
-      socket: Socket<ListenEvents, EmitEvents, ServerSideEvents>,
+      socket: Socket<ListenEvents, EmitEvents, ServerSideEvents, SocketData>,
       next: (err?: ExtendedError) => void
     ) => void
   ): this {
@@ -583,7 +664,7 @@ export class Server<
    * @return self
    * @public
    */
-  public to(room: Room | Room[]): BroadcastOperator<EmitEvents> {
+  public to(room: Room | Room[]): BroadcastOperator<EmitEvents, SocketData> {
     return this.sockets.to(room);
   }
 
@@ -594,7 +675,7 @@ export class Server<
    * @return self
    * @public
    */
-  public in(room: Room | Room[]): BroadcastOperator<EmitEvents> {
+  public in(room: Room | Room[]): BroadcastOperator<EmitEvents, SocketData> {
     return this.sockets.in(room);
   }
 
@@ -605,7 +686,9 @@ export class Server<
    * @return self
    * @public
    */
-  public except(name: Room | Room[]): BroadcastOperator<EmitEvents> {
+  public except(
+    name: Room | Room[]
+  ): BroadcastOperator<EmitEvents, SocketData> {
     return this.sockets.except(name);
   }
 
@@ -661,7 +744,9 @@ export class Server<
    * @return self
    * @public
    */
-  public compress(compress: boolean): BroadcastOperator<EmitEvents> {
+  public compress(
+    compress: boolean
+  ): BroadcastOperator<EmitEvents, SocketData> {
     return this.sockets.compress(compress);
   }
 
@@ -673,7 +758,7 @@ export class Server<
    * @return self
    * @public
    */
-  public get volatile(): BroadcastOperator<EmitEvents> {
+  public get volatile(): BroadcastOperator<EmitEvents, SocketData> {
     return this.sockets.volatile;
   }
 
@@ -683,7 +768,7 @@ export class Server<
    * @return self
    * @public
    */
-  public get local(): BroadcastOperator<EmitEvents> {
+  public get local(): BroadcastOperator<EmitEvents, SocketData> {
     return this.sockets.local;
   }
 
@@ -692,7 +777,7 @@ export class Server<
    *
    * @public
    */
-  public fetchSockets(): Promise<RemoteSocket<EmitEvents>[]> {
+  public fetchSockets(): Promise<RemoteSocket<EmitEvents, SocketData>[]> {
     return this.sockets.fetchSockets();
   }
 
@@ -749,3 +834,4 @@ module.exports.Namespace = Namespace;
 module.exports.Socket = Socket;
 
 export { Socket, ServerOptions, Namespace, BroadcastOperator, RemoteSocket };
+export { Event } from "./socket";

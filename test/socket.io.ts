@@ -14,6 +14,7 @@ import { io as ioc, Socket as ClientSocket } from "socket.io-client";
 
 import "./support/util";
 import "./utility-methods";
+import "./uws";
 
 type callback = (err: Error | null, success: boolean) => void;
 
@@ -820,29 +821,6 @@ describe("socket.io", () => {
       });
     });
 
-    it("should close a client without namespace (2)", (done) => {
-      const srv = createServer();
-      const sio = new Server(srv, {
-        connectTimeout: 100,
-      });
-
-      sio.use((_, next) => {
-        next(new Error("nope"));
-      });
-
-      srv.listen(() => {
-        const socket = client(srv);
-
-        const success = () => {
-          socket.close();
-          sio.close();
-          done();
-        };
-
-        socket.on("disconnect", success);
-      });
-    });
-
     it("should exclude a specific socket when emitting", (done) => {
       const srv = createServer();
       const io = new Server(srv);
@@ -1072,7 +1050,7 @@ describe("socket.io", () => {
           reconnectionDelay: 100,
         });
         clientSocket.on("connect", () => {
-          srv.close();
+          sio.close();
         });
 
         clientSocket.io.on("reconnect_failed", () => {
@@ -1437,6 +1415,32 @@ describe("socket.io", () => {
           setTimeout(() => {
             s.volatile.emit("ev", Buffer.from([1, 2, 3]));
             s.volatile.emit("ev", Buffer.from([4, 5, 6]));
+          }, 20);
+        });
+
+        const socket = client(srv, { transports: ["websocket"] });
+        socket.on("ev", () => {
+          counter++;
+        });
+      });
+
+      setTimeout(() => {
+        expect(counter).to.be(1);
+        done();
+      }, 200);
+    });
+
+    it("should broadcast only one consecutive volatile event with binary (ws)", (done) => {
+      const srv = createServer();
+      const sio = new Server(srv, { transports: ["websocket"] });
+
+      let counter = 0;
+      srv.listen(() => {
+        sio.on("connection", (s) => {
+          // Wait to make sure there are no packets being sent for opening the connection
+          setTimeout(() => {
+            sio.volatile.emit("ev", Buffer.from([1, 2, 3]));
+            sio.volatile.emit("ev", Buffer.from([4, 5, 6]));
           }, 20);
         });
 
@@ -1826,7 +1830,7 @@ describe("socket.io", () => {
           reconnectionDelay: 100,
         });
         clientSocket.once("connect", () => {
-          srv.close(() => {
+          sio.close(() => {
             clientSocket.io.on("reconnect", () => {
               clientSocket.emit("ev", "payload");
             });
@@ -2515,28 +2519,6 @@ describe("socket.io", () => {
         });
       });
     });
-
-    it("should pre encode a broadcast packet", (done) => {
-      const srv = createServer();
-      const sio = new Server(srv);
-
-      srv.listen(() => {
-        const clientSocket = client(srv, { multiplex: false });
-
-        sio.on("connection", (socket) => {
-          socket.conn.on("packetCreate", (packet) => {
-            expect(packet.data).to.eql('2["hello","world"]');
-            expect(packet.options.wsPreEncoded).to.eql('42["hello","world"]');
-
-            clientSocket.close();
-            sio.close();
-            done();
-          });
-
-          sio.emit("hello", "world");
-        });
-      });
-    });
   });
 
   describe("middleware", () => {
@@ -2725,6 +2707,25 @@ describe("socket.io", () => {
         if (++count === 2) done();
       });
     });
+
+    it("should only set `connected` to true after the middleware execution", (done) => {
+      const httpServer = createServer();
+      const io = new Server(httpServer);
+
+      const clientSocket = client(httpServer, "/");
+
+      io.use((socket, next) => {
+        expect(socket.connected).to.be(false);
+        expect(socket.disconnected).to.be(true);
+        next();
+      });
+
+      io.on("connection", (socket) => {
+        expect(socket.connected).to.be(true);
+        expect(socket.disconnected).to.be(false);
+        success(io, clientSocket, done);
+      });
+    });
   });
 
   describe("socket middleware", () => {
@@ -2864,4 +2865,6 @@ describe("socket.io", () => {
       });
     });
   });
+
+  require("./socket-timeout");
 });
