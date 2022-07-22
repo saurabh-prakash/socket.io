@@ -13,4 +13,5 @@ postRun:
   command:
     - node --version
 parallelism: 2
+splitMode: file
 version: 1.0
